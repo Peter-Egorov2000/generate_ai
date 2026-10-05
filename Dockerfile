@@ -1,20 +1,27 @@
 FROM python:3.12-slim
 
-# Устанавливаем системные зависимости, включая FFmpeg
+# Устанавливаем FFmpeg (нужен для MoviePy и imageio-ffmpeg)
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Создаём non-root пользователя (требование Hugging Face Spaces)
+RUN useradd -m -u 1000 appuser
+
 WORKDIR /app
 
-# Копируем и устанавливаем Python-зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем остальной код
 COPY . .
 
-# Открываем порт, который будет использовать Render
-EXPOSE 10000
+# Даём права на папку generated, чтобы пользователь appuser мог в неё писать
+RUN mkdir -p generated && chown -R appuser:appuser /app
 
-# Команда для запуска приложения
+# Переключаемся на non-root пользователя
+USER appuser
+
+# Hugging Face Spaces используют порт 7860
+ENV PORT=7860
+EXPOSE 7860
+
 CMD ["python", "app.py"]
