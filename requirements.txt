@@ -1,0 +1,7 @@
+gradio
+requests
+pillow
+edge-tts
+deep-translator
+imageio-ffmpeg
+moviepy
