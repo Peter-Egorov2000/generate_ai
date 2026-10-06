@@ -1,8 +1,7 @@
-gradio==5.29.0
+streamlit
 requests
 pillow
 edge-tts
 deep-translator
 imageio-ffmpeg
 moviepy
-boto3
