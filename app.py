@@ -1,4 +1,4 @@
-# pip install gradio requests pillow edge-tts deep-translator imageio-ffmpeg moviepy
+# pip install gradio requests pillow edge-tts deep-translator imageio-ffmpeg moviepy boto3
 import gradio as gr
 import requests
 from PIL import Image
@@ -14,7 +14,8 @@ import re
 import edge_tts
 import imageio_ffmpeg
 from deep_translator import MyMemoryTranslator
-
+import boto3
+from botocore.exceptions import ClientError
 from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
 try:
     from moviepy.audio.AudioClip import CompositeAudioClip
@@ -38,7 +39,24 @@ GUEST_KEYS = {
 }
 
 if not OWNER_PASSWORD:
-    raise ValueError("APP_PASSWORD не задан! Добавьте секрет APP_PASSWORD в настройках Space.")
+    raise ValueError("APP_PASSWORD не задан! Добавьте секрет APP_PASSWORD в настройках SnapDeploy.")
+
+# ========== НАСТРОЙКИ OBSIDEO (S3) ==========
+OBSIDEO_ACCESS_KEY = os.environ.get("OBSIDEO_ACCESS_KEY", "")
+OBSIDEO_SECRET_KEY = os.environ.get("OBSIDEO_SECRET_KEY", "")
+OBSIDEO_ENDPOINT = os.environ.get("OBSIDEO_ENDPOINT", "")
+OBSIDEO_BUCKET = os.environ.get("OBSIDEO_BUCKET", "generated-files")
+OBSIDEO_REGION = os.environ.get("OBSIDEO_REGION", "us-east-1")
+
+s3_client = None
+if OBSIDEO_ACCESS_KEY and OBSIDEO_SECRET_KEY and OBSIDEO_ENDPOINT:
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=OBSIDEO_ENDPOINT,
+        aws_access_key_id=OBSIDEO_ACCESS_KEY,
+        aws_secret_access_key=OBSIDEO_SECRET_KEY,
+        region_name=OBSIDEO_REGION,
+    )
 
 # ========== НАСТРОЙКИ ==========
 OUTPUT_DIR = os.path.abspath("generated")
@@ -91,6 +109,37 @@ def parse_model_name(model_label: str) -> str:
     if m:
         return m.group(1)
     return model_label.strip()
+
+
+# ========== ФУНКЦИИ OBSIDEO (S3) ==========
+def upload_to_obsideo(local_path, remote_key):
+    """Загружает локальный файл в Obsideo (S3-совместимое хранилище)."""
+    if not s3_client:
+        print("⚠️ Obsideo не настроен (проверьте OBSIDEO_* переменные).")
+        return None
+    try:
+        s3_client.upload_file(local_path, OBSIDEO_BUCKET, remote_key)
+        # Генерируем публичную ссылку (может потребоваться настройка публичного доступа к бакету)
+        url = f"{OBSIDEO_ENDPOINT.rstrip('/')}/{OBSIDEO_BUCKET}/{remote_key}"
+        print(f"✅ Загружено в Obsideo: {url}")
+        return url
+    except ClientError as e:
+        print(f"❌ Ошибка загрузки в Obsideo: {e}")
+        return None
+
+
+def download_from_obsideo(remote_key, local_path):
+    """Скачивает файл из Obsideo в локальный путь."""
+    if not s3_client:
+        return False
+    try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        s3_client.download_file(OBSIDEO_BUCKET, remote_key, local_path)
+        print(f"✅ Скачано из Obsideo: {remote_key} -> {local_path}")
+        return True
+    except ClientError as e:
+        print(f"❌ Ошибка скачивания из Obsideo: {e}")
+        return False
 
 
 # ========== ОЧИСТКА ВРЕМЕННЫХ ФАЙЛОВ ==========
@@ -153,10 +202,11 @@ def save_history(history):
         print(f"⚠️ Ошибка сохранения истории: {e}")
 
 
-def add_to_history(item_type, filepath, prompt, translated_prompt=""):
+def add_to_history(item_type, filepath, prompt, translated_prompt="", remote_url=None):
     history = load_history()
     entry = {
         "filepath": filepath,
+        "remote_url": remote_url,
         "filename": os.path.basename(filepath),
         "prompt": prompt,
         "translated_prompt": translated_prompt,
@@ -184,27 +234,37 @@ def get_history_gallery(item_type):
     items = history.get(item_type + "s", [])
     gallery_items = []
     for item in items:
-        path = item.get("filepath")
-        if path and os.path.exists(path):
+        # Пытаемся скачать из Obsideo, если локального файла нет
+        local_path = item.get("filepath")
+        if not os.path.exists(local_path) and item.get("remote_url"):
+            remote_key = item.get("filename")
+            local_path = os.path.join(OUTPUT_DIR, remote_key)
+            download_from_obsideo(remote_key, local_path)
+        if local_path and os.path.exists(local_path):
             caption = f"{item['date']}\n{item['prompt'][:60]}..."
-            gallery_items.append((path, caption))
+            gallery_items.append((local_path, caption))
     return gallery_items
 
 
 def get_history_details(item_type, index):
     history = load_history()
     items = history.get(item_type + "s", [])
-    valid_items = [i for i in items if os.path.exists(i.get("filepath", ""))]
+    valid_items = [i for i in items if os.path.exists(i.get("filepath", "")) or i.get("remote_url")]
     if index is None or index < 0 or index >= len(valid_items):
         return None, "Ничего не выбрано"
     item = valid_items[index]
+    local_path = item.get("filepath")
+    if not os.path.exists(local_path) and item.get("remote_url"):
+        remote_key = item.get("filename")
+        local_path = os.path.join(OUTPUT_DIR, remote_key)
+        download_from_obsideo(remote_key, local_path)
     info = (
         f"**Дата:** {item['date']}\n\n"
         f"**Промпт:** {item['prompt']}\n\n"
         f"**Перевод:** {item.get('translated_prompt', '—')}\n\n"
         f"**Файл:** {item['filename']}"
     )
-    return item["filepath"], info
+    return local_path, info
 
 
 # ========== ЗАГРУЗКА ИЗОБРАЖЕНИЯ ==========
@@ -444,7 +504,12 @@ def generate_image(prompt, width, height, model, seed, nologo, enhance,
     img = Image.open(BytesIO(r.content)).convert("RGB")
     filename = os.path.join(OUTPUT_DIR, f"img_{seed}.png")
     img.save(filename)
-    add_to_history("image", filename, prompt, translated_text)
+
+    # Загружаем в Obsideo и сохраняем удалённую ссылку
+    remote_key = f"images/img_{seed}.png"
+    remote_url = upload_to_obsideo(filename, remote_key)
+
+    add_to_history("image", filename, prompt, translated_text, remote_url)
 
     if secret_mode:
         TEMP_FILES.append(filename)
@@ -476,7 +541,6 @@ def batch_generate(prompts_text, width, height, model, enhance, do_translate,
 
 
 # ========== ГЕНЕРАЦИЯ ВИДЕО (AGNES) ==========
-
 def generate_video_agnes(prompt, image_url=None, width=1152, height=768,
                          num_frames=121, frame_rate=24, keys=None):
     if keys is None:
@@ -694,11 +758,17 @@ def generate_video(prompt, duration, resolution_choice, generation_mode_choice,
                                              width, height, progress):
         raise gr.Error("MoviePy не смог склеить клипы.")
 
+    # Загружаем видео в Obsideo
+    remote_video_key = f"videos/video_{timestamp}.mp4"
+    remote_video_url = upload_to_obsideo(final_filename, remote_video_key)
+
     if audio_path:
         audio_filename_out = os.path.abspath(os.path.join(OUTPUT_DIR, f"audio_{timestamp}.mp3"))
         shutil.copy(audio_path, audio_filename_out)
+        remote_audio_key = f"audio/audio_{timestamp}.mp3"
+        upload_to_obsideo(audio_filename_out, remote_audio_key)
 
-    add_to_history("video", final_filename, prompt, translated_text)
+    add_to_history("video", final_filename, prompt, translated_text, remote_video_url)
 
     if secret_mode:
         TEMP_FILES.append(final_filename)
@@ -713,7 +783,7 @@ def generate_video(prompt, duration, resolution_choice, generation_mode_choice,
 # ========== УДАЛЕНИЕ ИЗ ИСТОРИИ ==========
 def delete_from_history(item_type, index):
     history = load_history()
-    items = [i for i in history.get(item_type + "s", []) if os.path.exists(i.get("filepath", ""))]
+    items = [i for i in history.get(item_type + "s", []) if os.path.exists(i.get("filepath", "")) or i.get("remote_url")]
     if index is None or index < 0 or index >= len(items):
         return "⚠️ Ничего не выбрано", get_history_gallery("image"), get_history_gallery("video")
     item = items[index]
@@ -734,7 +804,6 @@ cleanup_old_files(AUTO_CLEAN_DAYS)
 
 # ========== ИНТЕРФЕЙС ==========
 with gr.Blocks(title="Генерация бесплатно!") as demo:
-    # Состояние сессии: какие ключи сейчас активны
     session_keys = gr.State(value=GUEST_KEYS)
 
     # ---------- ЭКРАН ВХОДА ----------
@@ -989,9 +1058,9 @@ with gr.Blocks(title="Генерация бесплатно!") as demo:
     def do_login(username, password):
         if username.strip() == OWNER_USERNAME and password == OWNER_PASSWORD:
             return (
-                gr.update(visible=False),   # login_screen → скрыть
-                gr.update(visible=True),    # main_screen → показать
-                OWNER_KEYS,                 # session_keys
+                gr.update(visible=False),
+                gr.update(visible=True),
+                OWNER_KEYS,
                 "✅ Добро пожаловать, владелец!",
             )
         return (
@@ -1027,5 +1096,4 @@ if __name__ == "__main__":
     demo.queue(max_size=30).launch(
         server_name="0.0.0.0",
         server_port=port,
-        # ssr_mode и auth НЕ НУЖНЫ — их обрабатывает платформа
     )
