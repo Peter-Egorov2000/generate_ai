@@ -1,4 +1,4 @@
-# pip install streamlit requests pillow edge-tts deep-translator imageio-ffmpeg moviepy
+# pip install streamlit requests pillow edge-tts deep-translator imageio-ffmpeg moviepy boto3
 import streamlit as st
 import requests
 from PIL import Image
@@ -11,6 +11,8 @@ import subprocess
 import shutil
 import json
 import re
+import base64
+import math
 import edge_tts
 import imageio_ffmpeg
 from deep_translator import MyMemoryTranslator
@@ -75,13 +77,42 @@ GENERATION_MODES = {
     "🔗 Последовательные клипы (оживление кадров)": "sequential",
 }
 
-MODEL_CHOICES = [
-    "⚡ turbo (быстро)",
+# ========== ПРОВАЙДЕРЫ ИЗОБРАЖЕНИЙ ==========
+IMAGE_PROVIDERS = {
+    "Pollinations": "pollinations",
+    "Agnes AI": "agnes",
+    "InferencePort (без цензуры)": "inferenceport",
+}
+
+# Доступные бесплатные модели Pollinations (без платных)
+POLLINATIONS_FREE_MODELS = [
     "🎨 flux (баланс)",
-    "💎 flux-pro (качество)",
-    "🚀 zimage (быстро + качество)",
-    "📷 gptimage (фотореализм)",
+    "⚡ turbo (быстро)",
+    "🖼️ stable-diffusion",
+    "🔄 kontext (image-to-image)",
+    "🍌 nanobanana",
+    "🌱 seedream",
 ]
+
+# Модели Agnes AI
+AGNES_MODELS = [
+    "agnes-image-2.5-flash",
+    "agnes-image-2.0-flash",
+]
+
+# Модели InferencePort (без цензуры)
+INFERENCEPORT_MODELS = [
+    "flux",
+    "qwen-image",
+    "seedream",
+    "gpt-image",
+    "ideogram",
+    "imagen",
+    "wan",
+]
+
+# URL InferencePort (OpenAI-совместимый, без ключа)
+INFERENCEPORT_BASE_URL = "https://inferenceport.ai/v1"
 
 
 def get_pollinations_headers(keys):
@@ -293,7 +324,7 @@ def concatenate_videos_with_progress(clip_paths, output_path, audio_path=None,
         final.write_videofile(
             abs_output,
             codec="libx264", audio_codec="aac",
-            fps=24, preset="fast", threads=4, logger=None,
+            fps=24, preset="ultrafast", threads=4, logger=None,
         )
         return os.path.exists(abs_output) and os.path.getsize(abs_output) > 1024
     except Exception as e:
@@ -310,13 +341,13 @@ def concatenate_videos_with_progress(clip_paths, output_path, audio_path=None,
                 pass
 
 
-# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ ==========
+# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ — ДИСПЕТЧЕР ==========
 def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
-                        do_translate, keys, status_cb=None):
+                        do_translate, keys, status_cb=None, provider="pollinations"):
+    """Диспетчер генерации изображений по провайдеру."""
     if not prompt or not prompt.strip():
         raise ValueError("Введи промпт!")
 
-    model = parse_model_name(model)
     final_prompt = prompt.strip()
     translated_text = ""
     if do_translate:
@@ -325,27 +356,129 @@ def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
         final_prompt = translate_to_english(prompt)
         translated_text = final_prompt
 
-    encoded = urllib.parse.quote(final_prompt)
-    seed = int(seed) if seed and seed > 0 else int(time.time() * 1000) % 1_000_000
-
-    url = (f"https://image.pollinations.ai/prompt/{encoded}"
-           f"?width={int(width)}&height={int(height)}&seed={seed}"
-           f"&model={model}&nologo={'true' if nologo else 'false'}"
-           f"&enhance={'true' if enhance else 'false'}")
-
     if status_cb:
-        status_cb(f"Генерирую ({model})...")
+        status_cb(f"Генерирую через {provider}...")
 
-    r = requests.get(url, headers=get_pollinations_headers(keys), timeout=180)
-    r.raise_for_status()
-    if not r.headers.get("Content-Type", "").startswith("image/"):
-        raise ValueError(f"Сервер вернул не картинку: {r.text[:200]}")
+    # --- Pollinations ---
+    if provider == "pollinations":
+        model_name = parse_model_name(model)
+        encoded = urllib.parse.quote(final_prompt)
+        seed_val = int(seed) if seed and seed > 0 else int(time.time() * 1000) % 1_000_000
+        url = (f"https://image.pollinations.ai/prompt/{encoded}"
+               f"?width={int(width)}&height={int(height)}&seed={seed_val}"
+               f"&model={model_name}&nologo={'true' if nologo else 'false'}"
+               f"&enhance={'true' if enhance else 'false'}")
 
-    img = Image.open(BytesIO(r.content)).convert("RGB")
-    filename = os.path.join(OUTPUT_DIR, f"img_{seed}.png")
+        r = requests.get(url, headers=get_pollinations_headers(keys), timeout=180)
+        if r.status_code == 402:
+            raise ValueError("❌ Лимит Pollinations исчерпан. Смените модель или провайдера.")
+        r.raise_for_status()
+        if not r.headers.get("Content-Type", "").startswith("image/"):
+            raise ValueError(f"Pollinations вернул не картинку: {r.text[:200]}")
+        img = Image.open(BytesIO(r.content)).convert("RGB")
+        seed_used = str(seed_val)
+
+    # --- Agnes AI ---
+    elif provider == "agnes":
+        img = generate_image_agnes(final_prompt, width, height, model, seed, keys)
+        seed_used = "—"
+
+    # --- InferencePort (без цензуры) ---
+    elif provider == "inferenceport":
+        img = generate_image_inferenceport(final_prompt, width, height, model, seed)
+        seed_used = "—"
+
+    else:
+        raise ValueError(f"Неизвестный провайдер: {provider}")
+
+    # Сохраняем результат
+    seed_for_file = seed_used if seed_used != "—" else int(time.time() * 1000) % 1_000_000
+    filename = os.path.join(OUTPUT_DIR, f"img_{seed_for_file}.png")
     img.save(filename)
     add_to_history("image", filename, prompt, translated_text)
-    return img, filename, str(seed), translated_text
+
+    return img, filename, str(seed_for_file), translated_text
+
+
+# ========== ГЕНЕРАЦИЯ ЧЕРЕЗ AGNES AI ==========
+def generate_image_agnes(prompt, width, height, model, seed=None, keys=None):
+    """Генерация изображения через Agnes AI API."""
+    if keys is None:
+        keys = GUEST_KEYS
+
+    agnes_key = keys.get("agnes", "")
+    if not agnes_key:
+        raise ValueError("AGNES_API_KEY не задан")
+
+    # Agnes принимает размер в формате "1024x768" или тир "1K", "2K"
+    if width >= 2048 or height >= 2048:
+        size = "2K"
+    elif width >= 1536 or height >= 1536:
+        size = "1K"
+    else:
+        size = f"{width}x{height}"
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+        "extra_body": {"response_format": "url"},
+    }
+    # Добавляем соотношение сторон, если размер задан тиром
+    if size in ("1K", "2K", "3K", "4K"):
+        gcd = math.gcd(width, height)
+        payload["ratio"] = f"{width // gcd}:{height // gcd}"
+
+    resp = requests.post(
+        "https://apihub.agnes-ai.com/v1/images/generations",
+        headers={
+            "Authorization": f"Bearer {agnes_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=180,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Agnes возвращает URL изображения
+    image_url = data.get("data", [{}])[0].get("url")
+    if not image_url:
+        raise ValueError(f"Agnes не вернул URL: {data}")
+
+    # Скачиваем изображение
+    img_resp = requests.get(image_url, timeout=120)
+    img_resp.raise_for_status()
+    return Image.open(BytesIO(img_resp.content)).convert("RGB")
+
+
+# ========== ГЕНЕРАЦИЯ ЧЕРЕЗ INFERENCEPORT (БЕЗ ЦЕНЗУРЫ) ==========
+def generate_image_inferenceport(prompt, width, height, model, seed=None):
+    """Генерация через InferencePort AI (без цензуры, OpenAI-совместимый API)."""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "size": f"{width}x{height}",
+        "response_format": "b64_json",
+    }
+    if seed:
+        payload["seed"] = seed
+
+    resp = requests.post(
+        f"{INFERENCEPORT_BASE_URL}/images/generations",
+        json=payload,
+        timeout=180,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    b64_data = data.get("data", [{}])[0].get("b64_json")
+    if not b64_data:
+        raise ValueError(f"InferencePort не вернул изображение: {data}")
+
+    img_bytes = base64.b64decode(b64_data)
+    return Image.open(BytesIO(img_bytes)).convert("RGB")
 
 
 # ========== ГЕНЕРАЦИЯ ВИДЕО (AGNES) ==========
@@ -554,6 +687,8 @@ if "img_result" not in st.session_state:
     st.session_state.img_result = None
 if "vid_result" not in st.session_state:
     st.session_state.vid_result = None
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results = []
 
 
 # ========== ЭКРАН ВХОДА ==========
@@ -570,7 +705,7 @@ def render_login():
 
     bcol1, bcol2 = st.columns(2)
     with bcol1:
-        if st.button("🔓 Войти", type="primary", use_container_width=True):
+        if st.button("🔓 Войти", type="primary", width="stretch"):
             if username.strip() == OWNER_USERNAME and password == OWNER_PASSWORD:
                 st.session_state.logged_in = True
                 st.session_state.is_owner = True
@@ -579,7 +714,7 @@ def render_login():
             else:
                 st.error("❌ Неверный логин или пароль")
     with bcol2:
-        if st.button("👤 Войти как гость", use_container_width=True):
+        if st.button("👤 Войти как гость", width="stretch"):
             st.session_state.logged_in = True
             st.session_state.is_owner = False
             st.session_state.session_keys = GUEST_KEYS
@@ -600,7 +735,7 @@ def render_main():
                 st.title("🎨 Генерация бесплатно!")
         else:
             st.title("🎨 Генерация бесплатно!")
-        st.caption("**Картинки:** Pollinations · **Видео:** Agnes AI · **Склейка:** MoviePy · **Озвучка:** EdgeTTS")
+        st.caption("**Картинки:** Pollinations · Agnes AI · InferencePort · **Видео:** Agnes AI · **Склейка:** MoviePy · **Озвучка:** EdgeTTS")
         role = "владелец" if st.session_state.is_owner else "гость"
         st.info(f"👤 Вы вошли как **{role}**")
 
@@ -611,7 +746,7 @@ def render_main():
         "📜 История",
     ])
 
-    # ========== ВКЛАДКА 1 ==========
+    # ========== ВКЛАДКА 1: ОДНА КАРТИНКА ==========
     with tab1:
         col_left, col_right = st.columns([2, 3])
 
@@ -620,13 +755,43 @@ def render_main():
                                   placeholder="кот-космонавт в стиле киберпанк, неон", height=100)
             do_translate = st.checkbox("🌐 Переводить на английский", value=True, key="img_translate")
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                model = st.selectbox("Модель", MODEL_CHOICES, index=1, key="img_model")
-            with c2:
-                nologo = st.checkbox("Без логотипа", value=True, key="img_nologo")
-            with c3:
-                enhance = st.checkbox("✨ Улучшить", value=True, key="img_enhance")
+            # --- Выбор провайдера ---
+            provider = st.selectbox(
+                "🏭 Провайдер изображений",
+                list(IMAGE_PROVIDERS.keys()),
+                index=0,
+                key="img_provider",
+                help="InferencePort — без цензуры, Agnes AI — качество, Pollinations — скорость",
+            )
+
+            # --- Модель (динамически меняется по провайдеру) ---
+            if provider == "Pollinations":
+                default_model = POLLINATIONS_FREE_MODELS[0]
+                model_choices = POLLINATIONS_FREE_MODELS
+            elif provider == "Agnes AI":
+                default_model = AGNES_MODELS[0]
+                model_choices = AGNES_MODELS
+            else:
+                default_model = INFERENCEPORT_MODELS[0]
+                model_choices = INFERENCEPORT_MODELS
+
+            model = st.selectbox(
+                "Модель",
+                model_choices,
+                index=0,
+                key=f"img_model_{provider}",
+            )
+
+            # --- Доп. опции только для Pollinations ---
+            if provider == "Pollinations":
+                c1, c2 = st.columns(2)
+                with c1:
+                    nologo = st.checkbox("Без логотипа", value=True, key="img_nologo")
+                with c2:
+                    enhance = st.checkbox("✨ Улучшить", value=True, key="img_enhance")
+            else:
+                nologo = True
+                enhance = False
 
             cw, ch = st.columns(2)
             with cw:
@@ -636,16 +801,17 @@ def render_main():
 
             seed = st.number_input("Seed (0 = случайный)", min_value=0, value=0, step=1, key="img_seed")
 
-            if st.button("✨ Сгенерировать", type="primary", use_container_width=True):
+            if st.button("✨ Сгенерировать", type="primary", width="stretch"):
                 try:
                     progress = st.progress(0, text="Старт...")
 
                     def status(text):
                         progress.progress(0.5, text=text)
 
+                    provider_key = IMAGE_PROVIDERS[provider]
                     img, path, seed_used, translated = generate_image_core(
                         prompt, width, height, model, seed, nologo, enhance,
-                        do_translate, keys, status
+                        do_translate, keys, status, provider_key
                     )
                     progress.progress(1.0, text="Готово!")
                     st.session_state.img_result = {
@@ -658,17 +824,17 @@ def render_main():
         with col_right:
             res = st.session_state.img_result
             if res:
-                st.image(res["img"], caption=f"seed={res['seed']}", use_container_width=True)
+                st.image(res["img"], caption=f"seed={res['seed']}", width="stretch")
                 with open(res["path"], "rb") as f:
                     st.download_button("⬇️ Скачать картинку", f,
                                        file_name=os.path.basename(res["path"]),
                                        mime="image/png",
-                                       use_container_width=True)
+                                       width="stretch")
                 if res.get("translated"):
                     st.text_area("📝 Промпт на английском", res["translated"], height=80,
                                  disabled=True, key="img_translated_view")
 
-    # ========== ВКЛАДКА 2 ==========
+    # ========== ВКЛАДКА 2: ПАЧКА ПРОМПТОВ ==========
     with tab2:
         st.markdown("Разделяй промпты через `;` или с новой строки.")
         col_left, col_right = st.columns([2, 3])
@@ -680,11 +846,26 @@ def render_main():
                 height=200, key="batch_prompts")
             b_do_translate = st.checkbox("🌐 Переводить на английский", value=True, key="batch_translate")
 
-            bc1, bc2 = st.columns(2)
-            with bc1:
-                b_model = st.selectbox("Модель", MODEL_CHOICES, index=3, key="batch_model")
-            with bc2:
+            b_provider = st.selectbox(
+                "🏭 Провайдер",
+                list(IMAGE_PROVIDERS.keys()),
+                index=0,
+                key="batch_provider",
+            )
+
+            if b_provider == "Pollinations":
+                b_model_choices = POLLINATIONS_FREE_MODELS
+            elif b_provider == "Agnes AI":
+                b_model_choices = AGNES_MODELS
+            else:
+                b_model_choices = INFERENCEPORT_MODELS
+
+            b_model = st.selectbox("Модель", b_model_choices, index=0, key="batch_model")
+
+            if b_provider == "Pollinations":
                 b_enhance = st.checkbox("✨ Улучшить", value=True, key="batch_enhance")
+            else:
+                b_enhance = False
 
             bw, bh = st.columns(2)
             with bw:
@@ -692,19 +873,20 @@ def render_main():
             with bh:
                 b_height = st.slider("Высота", 256, 1024, 768, 64, key="batch_height")
 
-            if st.button("🚀 Сгенерировать всё", type="primary", use_container_width=True):
+            if st.button("🚀 Сгенерировать всё", type="primary", width="stretch"):
                 if not batch_prompts.strip():
                     st.error("Введи промпты!")
                 else:
                     prompts = [p.strip() for p in batch_prompts.replace("\n", ";").split(";") if p.strip()]
                     results = []
                     progress = st.progress(0, text="Старт...")
+                    provider_key = IMAGE_PROVIDERS[b_provider]
                     for i, p in enumerate(prompts):
                         progress.progress(i / len(prompts), text=f"[{i+1}/{len(prompts)}] {p[:40]}...")
                         try:
                             img, path, seed_used, _ = generate_image_core(
                                 p, b_width, b_height, b_model, 0, True, b_enhance,
-                                b_do_translate, keys
+                                b_do_translate, keys, provider=provider_key
                             )
                             results.append((img, path, seed_used, p))
                         except Exception as e:
@@ -720,9 +902,9 @@ def render_main():
                 cols = st.columns(2)
                 for idx, (img, path, seed_used, p) in enumerate(results):
                     with cols[idx % 2]:
-                        st.image(img, caption=f"seed={seed_used} | {p[:40]}...", use_container_width=True)
+                        st.image(img, caption=f"seed={seed_used} | {p[:40]}...", width="stretch")
 
-    # ========== ВКЛАДКА 3 ==========
+    # ========== ВКЛАДКА 3: СОЗДАТЬ ВИДЕО ==========
     with tab3:
         st.markdown("""
         ### Генерация видео через Agnes AI
@@ -755,7 +937,7 @@ def render_main():
             with vc2:
                 voice_choice = st.selectbox("Голос", list(VOICES.keys()), index=0, key="vid_voice")
 
-            if st.button("🎬 Сгенерировать видео", type="primary", use_container_width=True):
+            if st.button("🎬 Сгенерировать видео", type="primary", width="stretch"):
                 if not video_prompt.strip():
                     st.error("Введи промпт для видео!")
                 else:
@@ -791,29 +973,29 @@ def render_main():
                 with open(res["video"], "rb") as f:
                     st.download_button("⬇️ Скачать видео (MP4)", f,
                                        file_name=os.path.basename(res["video"]),
-                                       mime="video/mp4", use_container_width=True)
+                                       mime="video/mp4", width="stretch")
                 if res.get("audio"):
                     st.audio(res["audio"])
                     with open(res["audio"], "rb") as f:
                         st.download_button("⬇️ Скачать озвучку (MP3)", f,
                                            file_name=os.path.basename(res["audio"]),
-                                           mime="audio/mpeg", use_container_width=True)
+                                           mime="audio/mpeg", width="stretch")
                 if res.get("audio_msg"):
                     st.info(res["audio_msg"])
                 if res.get("translated"):
                     st.text_area("📝 Промпт на английском", res["translated"],
                                  height=80, disabled=True, key="vid_translated_view")
 
-    # ========== ВКЛАДКА 4 ==========
+    # ========== ВКЛАДКА 4: ИСТОРИЯ ==========
     with tab4:
         st.markdown("### Прошлые генерации")
 
         c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
-            if st.button("🔄 Обновить", use_container_width=True):
+            if st.button("🔄 Обновить", width="stretch"):
                 st.rerun()
         with c2:
-            if st.button(f"🧹 Удалить старше {AUTO_CLEAN_DAYS} дней", use_container_width=True):
+            if st.button(f"🧹 Удалить старше {AUTO_CLEAN_DAYS} дней", width="stretch"):
                 n = cleanup_old_files(AUTO_CLEAN_DAYS)
                 st.success(f"🧹 Удалено {n} файлов")
                 time.sleep(1)
@@ -831,7 +1013,7 @@ def render_main():
                     with cols[i % 3]:
                         try:
                             st.image(item["filepath"], caption=f"{item['date']}\n{item['prompt'][:50]}...",
-                                     use_container_width=True)
+                                     width="stretch")
                             if st.button("🗑️ Удалить", key=f"del_img_{i}"):
                                 try:
                                     os.remove(item["filepath"])
