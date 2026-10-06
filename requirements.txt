@@ -5,3 +5,4 @@ edge-tts
 deep-translator
 imageio-ffmpeg
 moviepy
+boto3
