@@ -1027,5 +1027,5 @@ if __name__ == "__main__":
     demo.queue(max_size=30).launch(
         server_name="0.0.0.0",
         server_port=port,
-        # Больше никаких ssr_mode и auth
+        # ssr_mode и auth НЕ НУЖНЫ — их обрабатывает платформа
     )
