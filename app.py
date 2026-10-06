@@ -1091,9 +1091,12 @@ with gr.Blocks(title="Генерация бесплатно!") as demo:
 
 
 # ========== ЗАПУСК ==========
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    demo.queue(max_size=30).launch(
-        server_name="0.0.0.0",
-        server_port=port,
-    )
+demo.queue(max_size=30).launch(
+    server_name="0.0.0.0",
+    server_port=port,
+    # Добавьте эту строку, чтобы Gradio объединял CSS и JS в один файл
+    # Это уменьшит количество запросов в разы
+    favicon_path=None,  # или путь к вашей иконке
+    # Включите эту опцию, если она доступна в вашей версии Gradio
+    # pwa=True,  # или другой параметр для объединения
+)
