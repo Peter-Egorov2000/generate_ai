@@ -1,27 +1,29 @@
-FROM python:3.12-slim
+# Используем лёгкий образ Python
+FROM python:3.11-slim
 
-# Устанавливаем FFmpeg (нужен для MoviePy и imageio-ffmpeg)
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# Устанавливаем FFmpeg и другие системные зависимости
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Создаём non-root пользователя (требование Hugging Face Spaces)
-RUN useradd -m -u 1000 appuser
-
+# Устанавливаем рабочую директорию
 WORKDIR /app
 
+# Копируем и устанавливаем Python-зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Копируем весь код приложения
 COPY . .
 
-# Даём права на папку generated, чтобы пользователь appuser мог в неё писать
-RUN mkdir -p generated && chown -R appuser:appuser /app
+# Создаём папку для генерируемых файлов и даём права
+RUN mkdir -p generated && chmod 777 generated
 
-# Переключаемся на non-root пользователя
-USER appuser
-
-# Hugging Face Spaces используют порт 7860
-ENV PORT=7860
+# Сообщаем, что приложение будет слушать порт 7860
 EXPOSE 7860
 
+# Команда запуска. Northflank сам подставит нужный порт через переменную PORT
 CMD ["python", "app.py"]

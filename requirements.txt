@@ -1,4 +1,4 @@
-gradio
+gradio==5.29.0
 requests
 pillow
 edge-tts

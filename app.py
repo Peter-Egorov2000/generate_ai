@@ -8,30 +8,37 @@ import time
 import os
 import asyncio
 import subprocess
-import tempfile
 import shutil
 import json
 import re
 import edge_tts
 import imageio_ffmpeg
-from datetime import datetime, timedelta
 from deep_translator import MyMemoryTranslator
 
-# MoviePy 2.x — для склейки видео
 from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
 try:
     from moviepy.audio.AudioClip import CompositeAudioClip
 except Exception:
     CompositeAudioClip = None
 
-import os
+# ========== КЛЮЧИ И АВТОРИЗАЦИЯ ==========
+OWNER_USERNAME = os.environ.get("APP_USERNAME", "admin")
+OWNER_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
-POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")
-AGNES_API_KEY = os.environ.get("AGNES_API_KEY")
-IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY")
+OWNER_KEYS = {
+    "pollinations": os.environ.get("POLLINATIONS_API_KEY", ""),
+    "agnes": os.environ.get("AGNES_API_KEY", ""),
+    "imgbb": os.environ.get("IMGBB_API_KEY", ""),
+}
 
-if not all([POLLINATIONS_API_KEY, AGNES_API_KEY, IMGBB_API_KEY]):
-    raise ValueError("Не заданы API-ключи в переменных окружения!")
+GUEST_KEYS = {
+    "pollinations": os.environ.get("POLLINATIONS_API_KEY_GUEST", OWNER_KEYS["pollinations"]),
+    "agnes": os.environ.get("AGNES_API_KEY_GUEST", OWNER_KEYS["agnes"]),
+    "imgbb": os.environ.get("IMGBB_API_KEY_GUEST", OWNER_KEYS["imgbb"]),
+}
+
+if not OWNER_PASSWORD:
+    raise ValueError("APP_PASSWORD не задан! Добавьте секрет APP_PASSWORD в настройках Space.")
 
 # ========== НАСТРОЙКИ ==========
 OUTPUT_DIR = os.path.abspath("generated")
@@ -58,7 +65,6 @@ GENERATION_MODES = {
     "🔗 Последовательные клипы (оживление кадров)": "sequential",
 }
 
-# Список моделей для UI (метка → реальное имя в API)
 MODEL_CHOICES = [
     "⚡ turbo (быстро)",
     "🎨 flux (баланс)",
@@ -70,16 +76,15 @@ MODEL_CHOICES = [
 TEMP_FILES = []
 
 
-def get_pollinations_headers():
-    return {"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}
+def get_pollinations_headers(keys):
+    return {"Authorization": f"Bearer {keys['pollinations']}"}
 
 
-def get_agnes_headers():
-    return {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
+def get_agnes_headers(keys):
+    return {"Authorization": f"Bearer {keys['agnes']}", "Content-Type": "application/json"}
 
 
 def parse_model_name(model_label: str) -> str:
-    """Извлекает чистое имя модели из UI-метки, например '🎨 flux (баланс)' → 'flux'."""
     if not model_label:
         return "flux"
     m = re.match(r"^\S+\s+([a-zA-Z0-9\-_]+)", model_label.strip())
@@ -203,11 +208,14 @@ def get_history_details(item_type, index):
 
 
 # ========== ЗАГРУЗКА ИЗОБРАЖЕНИЯ ==========
-def upload_image_to_hosting(image_path):
+def upload_image_to_hosting(image_path, keys):
     for name, fn in [("ImgBB", upload_to_imgbb), ("Catbox", upload_to_catbox)]:
         try:
             print(f"📤 Пробую загрузить на {name}...")
-            url = fn(image_path)
+            if name == "ImgBB":
+                url = fn(image_path, keys)
+            else:
+                url = fn(image_path)
             if url:
                 print(f"✅ Загружено на {name}: {url}")
                 return url
@@ -218,13 +226,13 @@ def upload_image_to_hosting(image_path):
     return None
 
 
-def upload_to_imgbb(image_path):
-    if not IMGBB_API_KEY:
+def upload_to_imgbb(image_path, keys):
+    if not keys.get("imgbb"):
         return None
     with open(image_path, "rb") as f:
         r = requests.post(
             "https://api.imgbb.com/1/upload",
-            params={"key": IMGBB_API_KEY},
+            params={"key": keys["imgbb"]},
             files={"image": f},
             timeout=60
         )
@@ -286,7 +294,7 @@ def extract_last_frame(video_path, output_path):
         return False
 
 
-# ========== СКЛЕЙКА ВИДЕО ЧЕРЕЗ MOVIEPY 2.x ==========
+# ========== СКЛЕЙКА ВИДЕО ==========
 def concatenate_videos_with_progress(clip_paths, output_path, audio_path=None,
                                      width=1152, height=768, progress=None):
     if not clip_paths:
@@ -309,11 +317,6 @@ def concatenate_videos_with_progress(clip_paths, output_path, audio_path=None,
             print(f"📥 Загрузка клипа {i+1}/{len(clip_paths)}: {os.path.basename(path)}")
 
             clip = VideoFileClip(path)
-
-            if clip.audio is not None:
-                print(f"   🎵 Аудио есть")
-            else:
-                print(f"   🔇 Аудио нет")
 
             try:
                 clip = clip.resized(new_size=(int(width), int(height)))
@@ -402,7 +405,7 @@ def concatenate_videos_with_progress(clip_paths, output_path, audio_path=None,
 
 # ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ==========
 def generate_image(prompt, width, height, model, seed, nologo, enhance,
-                   do_translate, secret_mode, progress=gr.Progress()):
+                   do_translate, secret_mode, session_keys, progress=gr.Progress()):
     if not prompt or not prompt.strip():
         raise gr.Error("Введи промпт!")
 
@@ -429,7 +432,7 @@ def generate_image(prompt, width, height, model, seed, nologo, enhance,
 
     progress(0.4, desc=f"Генерирую ({model})...")
     try:
-        r = requests.get(url, headers=get_pollinations_headers(), timeout=180)
+        r = requests.get(url, headers=get_pollinations_headers(session_keys), timeout=180)
         r.raise_for_status()
     except requests.RequestException as e:
         raise gr.Error(f"Ошибка сети: {e}")
@@ -449,7 +452,7 @@ def generate_image(prompt, width, height, model, seed, nologo, enhance,
 
 
 def batch_generate(prompts_text, width, height, model, enhance, do_translate,
-                   progress=gr.Progress()):
+                   session_keys, progress=gr.Progress()):
     if not prompts_text or not prompts_text.strip():
         raise gr.Error("Введи промпты!")
     prompts = [p.strip() for p in prompts_text.replace("\n", ";").split(";") if p.strip()]
@@ -462,7 +465,8 @@ def batch_generate(prompts_text, width, height, model, enhance, do_translate,
     for i, p in enumerate(prompts):
         progress(i / len(prompts), desc=f"[{i+1}/{len(prompts)}] {p[:40]}...")
         try:
-            img, path, seed, _ = generate_image(p, width, height, model, 0, True, enhance, do_translate, False)
+            img, path, seed, _ = generate_image(p, width, height, model, 0, True, enhance,
+                                                do_translate, False, session_keys)
             results.append((img, f"seed={seed} | {p}"))
         except Exception as e:
             print(f"❌ '{p}': {e}")
@@ -472,8 +476,11 @@ def batch_generate(prompts_text, width, height, model, enhance, do_translate,
 
 
 # ========== ГЕНЕРАЦИЯ ВИДЕО (AGNES) ==========
+
 def generate_video_agnes(prompt, image_url=None, width=1152, height=768,
-                         num_frames=121, frame_rate=24):
+                         num_frames=121, frame_rate=24, keys=None):
+    if keys is None:
+        keys = GUEST_KEYS
     mode = "image-to-video" if image_url else "text-to-video"
     print(f"🎬 Agnes AI ({mode}, {width}x{height}, {num_frames} кадров @ {frame_rate}fps): {prompt[:50]}...")
 
@@ -494,7 +501,7 @@ def generate_video_agnes(prompt, image_url=None, width=1152, height=768,
             print(f"📡 Отправка задачи (попытка {attempt}/3, timeout=300 сек)...")
             resp = requests.post(
                 "https://apihub.agnes-ai.com/v1/videos",
-                headers=get_agnes_headers(), json=payload, timeout=300)
+                headers=get_agnes_headers(keys), json=payload, timeout=300)
             resp.raise_for_status()
             break
         except requests.exceptions.Timeout:
@@ -532,7 +539,7 @@ def generate_video_agnes(prompt, image_url=None, width=1152, height=768,
         try:
             poll = requests.get(
                 f"https://apihub.agnes-ai.com/agnesapi?video_id={video_id}",
-                headers=get_agnes_headers(), timeout=30)
+                headers=get_agnes_headers(keys), timeout=30)
         except requests.exceptions.RequestException:
             continue
         if poll.status_code != 200:
@@ -573,7 +580,6 @@ async def generate_speech(text, voice="ru-RU-DmitryNeural", rate="+0%"):
 
 
 def _nearest_8n_plus_1(target):
-    """Возвращает ближайшее к target число вида 8n+1, не превышающее 441."""
     candidates = [8 * n + 1 for n in range(1, 56)]
     candidates = [c for c in candidates if c <= 441]
     return min(candidates, key=lambda c: abs(c - target))
@@ -581,7 +587,7 @@ def _nearest_8n_plus_1(target):
 
 def generate_video(prompt, duration, resolution_choice, generation_mode_choice,
                    input_image, add_tts, voice_choice, do_translate, secret_mode,
-                   progress=gr.Progress()):
+                   session_keys, progress=gr.Progress()):
     if not prompt.strip():
         raise gr.Error("Введи промпт для видео!")
 
@@ -603,7 +609,7 @@ def generate_video(prompt, duration, resolution_choice, generation_mode_choice,
     image_url = None
     if input_image is not None:
         progress(0.1, desc="Загружаю фото на хостинг...")
-        image_url = upload_image_to_hosting(input_image)
+        image_url = upload_image_to_hosting(input_image, session_keys)
         if not image_url:
             raise gr.Error("Не удалось загрузить фото на хостинг.")
 
@@ -644,7 +650,7 @@ def generate_video(prompt, duration, resolution_choice, generation_mode_choice,
             if previous_clip_path and os.path.exists(previous_clip_path):
                 last_frame_path = os.path.join(tmp_dir, f"last_frame_{i:02d}.png")
                 if extract_last_frame(previous_clip_path, last_frame_path):
-                    uploaded_url = upload_image_to_hosting(last_frame_path)
+                    uploaded_url = upload_image_to_hosting(last_frame_path, session_keys)
                     if uploaded_url:
                         clip_image = uploaded_url
                         print(f"   🖼️ Использую последний кадр клипа {i} как начальный")
@@ -654,7 +660,7 @@ def generate_video(prompt, duration, resolution_choice, generation_mode_choice,
                     print(f"   ⚠️ Не удалось извлечь последний кадр")
 
         clip_data = generate_video_agnes(scene_prompt, clip_image, width, height,
-                                         num_frames, frame_rate)
+                                         num_frames, frame_rate, session_keys)
         if not clip_data:
             raise gr.Error(f"Не удалось сгенерировать клип {i+1}.")
 
@@ -704,7 +710,7 @@ def generate_video(prompt, duration, resolution_choice, generation_mode_choice,
     return final_filename, audio_filename_out, audio_msg, translated_text
 
 
-# ========== УДАЛЕНИЕ ИЗ ИСТОРИИ + ФАЙЛА ==========
+# ========== УДАЛЕНИЕ ИЗ ИСТОРИИ ==========
 def delete_from_history(item_type, index):
     history = load_history()
     items = [i for i in history.get(item_type + "s", []) if os.path.exists(i.get("filepath", ""))]
@@ -722,243 +728,304 @@ def delete_from_history(item_type, index):
     return f"✅ Удалено: {item['filename']}", get_history_gallery("image"), get_history_gallery("video")
 
 
-# ========== ЗАПУСК АВТООЧИСТКИ ПРИ СТАРТЕ ==========
+# ========== ЗАПУСК АВТООЧИСТКИ ==========
 cleanup_old_files(AUTO_CLEAN_DAYS)
 
 
 # ========== ИНТЕРФЕЙС ==========
 with gr.Blocks(title="Генерация бесплатно!") as demo:
-    with gr.Row():
-        if os.path.exists(LOGO_PATH):
-            gr.Image(value=LOGO_PATH, show_label=False, height=80, width=80,
-                     show_download_button=False, show_fullscreen_button=False,
-                     container=False, scale=0)
-        with gr.Column(scale=1):
+    # Состояние сессии: какие ключи сейчас активны
+    session_keys = gr.State(value=GUEST_KEYS)
+
+    # ---------- ЭКРАН ВХОДА ----------
+    with gr.Column(visible=True) as login_screen:
+        with gr.Row():
             gr.Markdown("""
             # 🎨 Генерация бесплатно!
             ### ИИ-генератор картинок и видео
-            **Картинки:** Pollinations · **Видео:** Agnes AI · **Склейка:** MoviePy · **Озвучка:** EdgeTTS
+            Войдите как владелец или продолжите как гость.
             """)
-
-    with gr.Tabs():
-        # ===== ВКЛАДКА 1 =====
-        with gr.Tab("🖼️ Одна картинка"):
+        with gr.Column(scale=1):
+            login_username = gr.Textbox(label="Имя пользователя", placeholder="admin")
+            login_password = gr.Textbox(label="Пароль", type="password", placeholder="••••••")
             with gr.Row():
-                with gr.Column(scale=2):
-                    prompt = gr.Textbox(label="Промпт (можно на русском)",
-                                        placeholder="кот-космонавт в стиле киберпанк, неон", lines=3)
-                    do_translate = gr.Checkbox(value=True, label="🌐 Переводить на английский")
-                    translated_out = gr.Textbox(label="📝 Промпт на английском", interactive=False, lines=2)
-                    with gr.Row():
-                        model = gr.Dropdown(
-                            choices=MODEL_CHOICES,
-                            value="🎨 flux (баланс)",
-                            label="Модель",
-                            info="turbo — быстрее · flux-pro — качественнее · zimage — компромисс · gptimage — фотореализм",
-                        )
-                        nologo = gr.Checkbox(value=True, label="Без логотипа")
-                        enhance = gr.Checkbox(value=True, label="✨ Улучшить промпт")
-                    with gr.Row():
-                        width = gr.Slider(256, 1536, value=1024, step=64, label="Ширина")
-                        height = gr.Slider(256, 1536, value=1024, step=64, label="Высота")
-                    seed = gr.Number(value=0, label="Seed (0 = случайный)", precision=0)
-                    secret_img = gr.Checkbox(value=False, label="🔒 Секретно (удалить после новой задачи)")
-                    btn = gr.Button("✨ Сгенерировать", variant="primary", size="lg")
-                    used_seed = gr.Textbox(label="Использованный seed", interactive=False)
-                with gr.Column(scale=3):
-                    output_img = gr.Image(label="Результат", type="pil", height=600)
-                    download_img = gr.File(label="⬇️ Скачать картинку", interactive=False)
-            btn.click(fn=generate_image,
-                      inputs=[prompt, width, height, model, seed, nologo, enhance, do_translate, secret_img],
-                      outputs=[output_img, download_img, used_seed, translated_out],
-                      concurrency_limit=2)
-            prompt.submit(fn=generate_image,
-                          inputs=[prompt, width, height, model, seed, nologo, enhance, do_translate, secret_img],
+                login_btn = gr.Button("🔓 Войти", variant="primary", size="lg")
+                guest_btn = gr.Button("👤 Войти как гость", variant="secondary", size="lg")
+            login_message = gr.Markdown("")
+
+    # ---------- ОСНОВНОЙ ЭКРАН ----------
+    with gr.Column(visible=False) as main_screen:
+        with gr.Row():
+            if os.path.exists(LOGO_PATH):
+                gr.Image(value=LOGO_PATH, show_label=False, height=80, width=80,
+                         show_download_button=False, show_fullscreen_button=False,
+                         container=False, scale=0)
+            with gr.Column(scale=1):
+                gr.Markdown("""
+                # 🎨 Генерация бесплатно!
+                ### ИИ-генератор картинок и видео
+                **Картинки:** Pollinations · **Видео:** Agnes AI · **Склейка:** MoviePy · **Озвучка:** EdgeTTS
+                """)
+
+        with gr.Tabs():
+            # ===== ВКЛАДКА 1 =====
+            with gr.Tab("🖼️ Одна картинка"):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        prompt = gr.Textbox(label="Промпт (можно на русском)",
+                                            placeholder="кот-космонавт в стиле киберпанк, неон", lines=3)
+                        do_translate = gr.Checkbox(value=True, label="🌐 Переводить на английский")
+                        translated_out = gr.Textbox(label="📝 Промпт на английском", interactive=False, lines=2)
+                        with gr.Row():
+                            model = gr.Dropdown(
+                                choices=MODEL_CHOICES,
+                                value="🎨 flux (баланс)",
+                                label="Модель",
+                                info="turbo — быстрее · flux-pro — качественнее · zimage — компромисс · gptimage — фотореализм",
+                            )
+                            nologo = gr.Checkbox(value=True, label="Без логотипа")
+                            enhance = gr.Checkbox(value=True, label="✨ Улучшить промпт")
+                        with gr.Row():
+                            width = gr.Slider(256, 1536, value=1024, step=64, label="Ширина")
+                            height = gr.Slider(256, 1536, value=1024, step=64, label="Высота")
+                        seed = gr.Number(value=0, label="Seed (0 = случайный)", precision=0)
+                        secret_img = gr.Checkbox(value=False, label="🔒 Секретно (удалить после новой задачи)")
+                        btn = gr.Button("✨ Сгенерировать", variant="primary", size="lg")
+                        used_seed = gr.Textbox(label="Использованный seed", interactive=False)
+                    with gr.Column(scale=3):
+                        output_img = gr.Image(label="Результат", type="pil", height=600)
+                        download_img = gr.File(label="⬇️ Скачать картинку", interactive=False)
+                btn.click(fn=generate_image,
+                          inputs=[prompt, width, height, model, seed, nologo, enhance,
+                                  do_translate, secret_img, session_keys],
                           outputs=[output_img, download_img, used_seed, translated_out],
                           concurrency_limit=2)
+                prompt.submit(fn=generate_image,
+                              inputs=[prompt, width, height, model, seed, nologo, enhance,
+                                      do_translate, secret_img, session_keys],
+                              outputs=[output_img, download_img, used_seed, translated_out],
+                              concurrency_limit=2)
 
-        # ===== ВКЛАДКА 2 =====
-        with gr.Tab("📦 Пачка промптов"):
-            gr.Markdown("Разделяй промпты через `;` или с новой строки.")
-            with gr.Row():
-                with gr.Column(scale=2):
-                    batch_prompts = gr.Textbox(label="Промпты",
-                                               placeholder="киберпанк город ночью;\nробот-самурай;\nкрасный дракон над горами", lines=8)
-                    b_do_translate = gr.Checkbox(value=True, label="🌐 Переводить на английский")
-                    with gr.Row():
-                        b_model = gr.Dropdown(
-                            choices=MODEL_CHOICES,
-                            value="🚀 zimage (быстро + качество)",
-                            label="Модель",
-                            info="Для пачки лучше zimage — быстро и качественно",
+            # ===== ВКЛАДКА 2 =====
+            with gr.Tab("📦 Пачка промптов"):
+                gr.Markdown("Разделяй промпты через `;` или с новой строки.")
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        batch_prompts = gr.Textbox(label="Промпты",
+                                                   placeholder="киберпанк город ночью;\nробот-самурай;\nкрасный дракон над горами", lines=8)
+                        b_do_translate = gr.Checkbox(value=True, label="🌐 Переводить на английский")
+                        with gr.Row():
+                            b_model = gr.Dropdown(
+                                choices=MODEL_CHOICES,
+                                value="🚀 zimage (быстро + качество)",
+                                label="Модель",
+                                info="Для пачки лучше zimage — быстро и качественно",
+                            )
+                            b_enhance = gr.Checkbox(value=True, label="✨ Улучшить")
+                        with gr.Row():
+                            b_width = gr.Slider(256, 1024, value=768, step=64, label="Ширина")
+                            b_height = gr.Slider(256, 1024, value=768, step=64, label="Высота")
+                        b_btn = gr.Button("🚀 Сгенерировать всё", variant="primary", size="lg")
+                    with gr.Column(scale=3):
+                        gallery = gr.Gallery(label="Результаты", columns=2, height=600, show_label=True)
+                b_btn.click(fn=batch_generate,
+                            inputs=[batch_prompts, b_width, b_height, b_model, b_enhance,
+                                    b_do_translate, session_keys],
+                            outputs=[gallery], concurrency_limit=1)
+
+            # ===== ВКЛАДКА 3 =====
+            with gr.Tab("🎬 Создать видео"):
+                gr.Markdown("""
+                ### Генерация видео через Agnes AI
+                - **Цельный клип** — один запрос, до ~18 секунд (лимит API: 441 кадр при 24 fps)
+                - **Последовательные клипы** — клипы по 5 сек, каждый следующий начинается с **последнего кадра** предыдущего
+                - **Фото → Видео** — загрузи картинку, и она оживёт
+                - **Очередь:** одновременно генерируется только 1 видео. Остальные ждут.
+                """)
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        video_prompt = gr.Textbox(label="Промпт для видео (можно на русском)",
+                                                  placeholder="кот танцует на пляже, волны разбиваются о берег", lines=3)
+                        input_image = gr.Image(
+                            label="📷 Начальный кадр (необязательно)",
+                            type="filepath", height=200,
                         )
-                        b_enhance = gr.Checkbox(value=True, label="✨ Улучшить")
-                    with gr.Row():
-                        b_width = gr.Slider(256, 1024, value=768, step=64, label="Ширина")
-                        b_height = gr.Slider(256, 1024, value=768, step=64, label="Высота")
-                    b_btn = gr.Button("🚀 Сгенерировать всё", variant="primary", size="lg")
-                with gr.Column(scale=3):
-                    gallery = gr.Gallery(label="Результаты", columns=2, height=600, show_label=True)
-            b_btn.click(fn=batch_generate,
-                        inputs=[batch_prompts, b_width, b_height, b_model, b_enhance, b_do_translate],
-                        outputs=[gallery], concurrency_limit=1)
+                        v_do_translate = gr.Checkbox(value=True, label="🌐 Переводить промпт на английский")
+                        v_translated_out = gr.Textbox(label="📝 Промпт на английском", interactive=False, lines=2)
+                        video_duration = gr.Slider(minimum=5, maximum=60, value=10, step=5,
+                                                   label="Длительность (секунд)",
+                                                   info="Кратно 5 сек: 5, 10, 15, 20...")
+                        generation_mode = gr.Radio(
+                            choices=list(GENERATION_MODES.keys()),
+                            value="🎞️ Цельный клип (до 18 сек)",
+                            label="🎬 Режим генерации",
+                            info="Цельный — один вызов API. Последовательный — клипы по 5 сек с оживлением кадров."
+                        )
+                        resolution_choice = gr.Dropdown(
+                            choices=list(RESOLUTIONS.keys()),
+                            value="768p (быстро)",
+                            label="📺 Разрешение видео",
+                            info="1080p — качественнее, но медленнее",
+                        )
+                        with gr.Row():
+                            add_tts = gr.Checkbox(value=False, label="🗣️ Озвучить промпт (TTS)")
+                            voice_choice = gr.Dropdown(choices=list(VOICES.keys()),
+                                                       value="Русский (Дмитрий)", label="Голос")
+                        secret_vid = gr.Checkbox(value=False, label="🔒 Секретно (удалить после новой задачи)")
+                        video_btn = gr.Button("🎬 Сгенерировать видео", variant="primary", size="lg")
+                        audio_status = gr.Textbox(label="Статус озвучки", interactive=False)
+                    with gr.Column(scale=3):
+                        video_output = gr.Video(label="Результат", height=450)
+                        download_video = gr.File(label="⬇️ Скачать видео (MP4)", interactive=False)
+                        audio_output = gr.Audio(label="⬇️ Скачать озвучку отдельно (MP3)", type="filepath")
+                video_btn.click(
+                    fn=generate_video,
+                    inputs=[video_prompt, video_duration, resolution_choice, generation_mode,
+                            input_image, add_tts, voice_choice, v_do_translate, secret_vid,
+                            session_keys],
+                    outputs=[video_output, audio_output, audio_status, v_translated_out],
+                    concurrency_limit=1,
+                )
 
-        # ===== ВКЛАДКА 3: СОЗДАТЬ ВИДЕО =====
-        with gr.Tab("🎬 Создать видео"):
-            gr.Markdown("""
-            ### Генерация видео через Agnes AI
-            - **Цельный клип** — один запрос, до ~18 секунд (лимит API: 441 кадр при 24 fps)
-            - **Последовательные клипы** — клипы по 5 сек, каждый следующий начинается с **последнего кадра** предыдущего
-            - **Фото → Видео** — загрузи картинку, и она оживёт
-            - **Очередь:** одновременно генерируется только 1 видео. Остальные ждут.
-            """)
-            with gr.Row():
-                with gr.Column(scale=2):
-                    video_prompt = gr.Textbox(label="Промпт для видео (можно на русском)",
-                                              placeholder="кот танцует на пляже, волны разбиваются о берег", lines=3)
-                    input_image = gr.Image(
-                        label="📷 Начальный кадр (необязательно)",
-                        type="filepath", height=200,
-                    )
-                    v_do_translate = gr.Checkbox(value=True, label="🌐 Переводить промпт на английский")
-                    v_translated_out = gr.Textbox(label="📝 Промпт на английском", interactive=False, lines=2)
-                    video_duration = gr.Slider(minimum=5, maximum=60, value=10, step=5,
-                                               label="Длительность (секунд)",
-                                               info="Кратно 5 сек: 5, 10, 15, 20...")
-                    generation_mode = gr.Radio(
-                        choices=list(GENERATION_MODES.keys()),
-                        value="🎞️ Цельный клип (до 18 сек)",
-                        label="🎬 Режим генерации",
-                        info="Цельный — один вызов API. Последовательный — клипы по 5 сек с оживлением кадров."
-                    )
-                    resolution_choice = gr.Dropdown(
-                        choices=list(RESOLUTIONS.keys()),
-                        value="768p (быстро)",
-                        label="📺 Разрешение видео",
-                        info="1080p — качественнее, но медленнее",
-                    )
-                    with gr.Row():
-                        add_tts = gr.Checkbox(value=False, label="🗣️ Озвучить промпт (TTS)")
-                        voice_choice = gr.Dropdown(choices=list(VOICES.keys()),
-                                                   value="Русский (Дмитрий)", label="Голос")
-                    secret_vid = gr.Checkbox(value=False, label="🔒 Секретно (удалить после новой задачи)")
-                    video_btn = gr.Button("🎬 Сгенерировать видео", variant="primary", size="lg")
-                    audio_status = gr.Textbox(label="Статус озвучки", interactive=False)
-                with gr.Column(scale=3):
-                    video_output = gr.Video(label="Результат", height=450)
-                    download_video = gr.File(label="⬇️ Скачать видео (MP4)", interactive=False)
-                    audio_output = gr.Audio(label="⬇️ Скачать озвучку отдельно (MP3)", type="filepath")
-            video_btn.click(
-                fn=generate_video,
-                inputs=[video_prompt, video_duration, resolution_choice, generation_mode,
-                        input_image, add_tts, voice_choice, v_do_translate, secret_vid],
-                outputs=[video_output, audio_output, audio_status, v_translated_out],
-                concurrency_limit=1,
+            # ===== ВКЛАДКА 4 =====
+            with gr.Tab("📜 История"):
+                gr.Markdown("### Ваши прошлые генерации. Клик по элементу — большая версия + промпт.")
+                with gr.Row():
+                    refresh_btn = gr.Button("🔄 Обновить историю", variant="secondary", size="lg")
+                    clean_btn = gr.Button(f"🧹 Удалить старше {AUTO_CLEAN_DAYS} дней", variant="secondary", size="lg")
+                    clean_status = gr.Textbox(label="Статус", interactive=False, scale=2)
+
+                with gr.Tabs():
+                    with gr.Tab("🖼️ Картинки"):
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                history_images_gallery = gr.Gallery(
+                                    label="Кликни для просмотра", columns=3, height=500)
+                            with gr.Column(scale=1):
+                                preview_img = gr.Image(label="Просмотр", height=400)
+                                info_img = gr.Markdown("Ничего не выбрано")
+                                del_img_btn = gr.Button("🗑️ Удалить выбранное", variant="stop")
+
+                    with gr.Tab("🎬 Видео"):
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                history_videos_gallery = gr.Gallery(
+                                    label="Кликни для просмотра", columns=2, height=500)
+                            with gr.Column(scale=1):
+                                preview_vid = gr.Video(label="Просмотр", height=400)
+                                info_vid = gr.Markdown("Ничего не выбрано")
+                                del_vid_btn = gr.Button("🗑️ Удалить выбранное", variant="stop")
+
+                def refresh_all():
+                    return get_history_gallery("image"), get_history_gallery("video")
+
+                def do_clean():
+                    n = cleanup_old_files(AUTO_CLEAN_DAYS)
+                    return f"🧹 Удалено {n} файлов", *refresh_all()
+
+                refresh_btn.click(fn=refresh_all,
+                                  outputs=[history_images_gallery, history_videos_gallery])
+                clean_btn.click(fn=do_clean,
+                                outputs=[clean_status, history_images_gallery, history_videos_gallery])
+
+                def on_img_select(evt: gr.SelectData):
+                    path, info = get_history_details("image", evt.index)
+                    return path, info
+                history_images_gallery.select(fn=on_img_select,
+                                              outputs=[preview_img, info_img])
+
+                def on_vid_select(evt: gr.SelectData):
+                    path, info = get_history_details("video", evt.index)
+                    return path, info
+                history_videos_gallery.select(fn=on_vid_select,
+                                              outputs=[preview_vid, info_vid])
+
+                selected_img_idx = gr.State(-1)
+                selected_vid_idx = gr.State(-1)
+
+                def save_img_idx(evt: gr.SelectData):
+                    return evt.index
+                history_images_gallery.select(fn=save_img_idx, outputs=[selected_img_idx])
+                history_videos_gallery.select(fn=save_img_idx, outputs=[selected_vid_idx])
+
+                del_img_btn.click(
+                    fn=lambda i: delete_from_history("image", i),
+                    inputs=[selected_img_idx],
+                    outputs=[clean_status, history_images_gallery, history_videos_gallery],
+                )
+                del_vid_btn.click(
+                    fn=lambda i: delete_from_history("video", i),
+                    inputs=[selected_vid_idx],
+                    outputs=[clean_status, history_images_gallery, history_videos_gallery],
+                )
+
+                demo.load(fn=cleanup_on_load,
+                          outputs=[history_images_gallery, history_videos_gallery])
+
+        gr.Markdown("""
+        ---
+        💡 **Советы:**
+        - **Модели картинок:** ⚡ turbo — быстро · 🎨 flux — баланс · 💎 flux-pro — качество · 🚀 zimage — быстро+качество · 📷 gptimage — фотореализм
+        - **✨ Улучшить промпт** — LLM дополнит описание деталями и стилем
+        - **Цельный клип** лучше для длительности ≤ 18 сек — быстрее и без склейки
+        - **Последовательные клипы** — для длинных видео с плавным переходом между сценами
+        - Для видео описывай **движение**: `дрон летит над горами`, `волны разбиваются`
+        """)
+
+        gr.Markdown("""
+        ---
+        <div style="text-align: center; padding: 20px 0; color: #666;">
+            <p style="font-size: 16px; margin: 6px 0;"><b>Создано Egorov Company (Пётр Егоров)</b></p>
+            <p style="font-size: 15px; margin: 6px 0;">
+                📞 Телефон для связи: <a href="tel:+79911548118" style="color: #4a90e2; text-decoration: none;">8 991 154 81 18</a>
+            </p>
+            <p style="font-size: 13px; margin: 12px 0 0 0; color: #999;">
+                © 2026 Генерация бесплатно! Все права защищены.
+            </p>
+        </div>
+        """)
+
+    # ---------- ОБРАБОТЧИКИ ВХОДА ----------
+    def do_login(username, password):
+        if username.strip() == OWNER_USERNAME and password == OWNER_PASSWORD:
+            return (
+                gr.update(visible=False),   # login_screen → скрыть
+                gr.update(visible=True),    # main_screen → показать
+                OWNER_KEYS,                 # session_keys
+                "✅ Добро пожаловать, владелец!",
             )
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            GUEST_KEYS,
+            "❌ Неверный логин или пароль. Попробуйте снова или войдите как гость.",
+        )
 
-        # ===== ВКЛАДКА 4: ИСТОРИЯ =====
-        with gr.Tab("📜 История"):
-            gr.Markdown("### Ваши прошлые генерации. Клик по элементу — большая версия + промпт.")
-            with gr.Row():
-                refresh_btn = gr.Button("🔄 Обновить историю", variant="secondary", size="lg")
-                clean_btn = gr.Button(f"🧹 Удалить старше {AUTO_CLEAN_DAYS} дней", variant="secondary", size="lg")
-                clean_status = gr.Textbox(label="Статус", interactive=False, scale=2)
+    def do_guest():
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            GUEST_KEYS,
+            "👤 Вы вошли как гость. Используются гостевые ключи.",
+        )
 
-            with gr.Tabs():
-                with gr.Tab("🖼️ Картинки"):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            history_images_gallery = gr.Gallery(
-                                label="Кликни для просмотра", columns=3, height=500)
-                        with gr.Column(scale=1):
-                            preview_img = gr.Image(label="Просмотр", height=400)
-                            info_img = gr.Markdown("Ничего не выбрано")
-                            del_img_btn = gr.Button("🗑️ Удалить выбранное", variant="stop")
-
-                with gr.Tab("🎬 Видео"):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            history_videos_gallery = gr.Gallery(
-                                label="Кликни для просмотра", columns=2, height=500)
-                        with gr.Column(scale=1):
-                            preview_vid = gr.Video(label="Просмотр", height=400)
-                            info_vid = gr.Markdown("Ничего не выбрано")
-                            del_vid_btn = gr.Button("🗑️ Удалить выбранное", variant="stop")
-
-            def refresh_all():
-                return get_history_gallery("image"), get_history_gallery("video")
-
-            def do_clean():
-                n = cleanup_old_files(AUTO_CLEAN_DAYS)
-                return f"🧹 Удалено {n} файлов", *refresh_all()
-
-            refresh_btn.click(fn=refresh_all,
-                              outputs=[history_images_gallery, history_videos_gallery])
-            clean_btn.click(fn=do_clean,
-                            outputs=[clean_status, history_images_gallery, history_videos_gallery])
-
-            def on_img_select(evt: gr.SelectData):
-                path, info = get_history_details("image", evt.index)
-                return path, info
-            history_images_gallery.select(fn=on_img_select,
-                                          outputs=[preview_img, info_img])
-
-            def on_vid_select(evt: gr.SelectData):
-                path, info = get_history_details("video", evt.index)
-                return path, info
-            history_videos_gallery.select(fn=on_vid_select,
-                                          outputs=[preview_vid, info_vid])
-
-            selected_img_idx = gr.State(-1)
-            selected_vid_idx = gr.State(-1)
-
-            def save_img_idx(evt: gr.SelectData):
-                return evt.index
-            history_images_gallery.select(fn=save_img_idx, outputs=[selected_img_idx])
-            history_videos_gallery.select(fn=save_img_idx, outputs=[selected_vid_idx])
-
-            del_img_btn.click(
-                fn=lambda i: delete_from_history("image", i),
-                inputs=[selected_img_idx],
-                outputs=[clean_status, history_images_gallery, history_videos_gallery],
-            )
-            del_vid_btn.click(
-                fn=lambda i: delete_from_history("video", i),
-                inputs=[selected_vid_idx],
-                outputs=[clean_status, history_images_gallery, history_videos_gallery],
-            )
-
-            demo.load(fn=cleanup_on_load,
-                      outputs=[history_images_gallery, history_videos_gallery])
-
-    gr.Markdown("""
-    ---
-    💡 **Советы:**
-    - **Модели картинок:** ⚡ turbo — быстро · 🎨 flux — баланс · 💎 flux-pro — качество · 🚀 zimage — быстро+качество · 📷 gptimage — фотореализм
-    - **✨ Улучшить промпт** — LLM дополнит описание деталями и стилем
-    - **Цельный клип** лучше для длительности ≤ 18 сек — быстрее и без склейки
-    - **Последовательные клипы** — для длинных видео с плавным переходом между сценами
-    - Для видео описывай **движение**: `дрон летит над горами`, `волны разбиваются`
-    """)
-
-    gr.Markdown("""
-    ---
-    <div style="text-align: center; padding: 20px 0; color: #666;">
-        <p style="font-size: 16px; margin: 6px 0;"><b>Создано Egorov Company (Пётр Егоров)</b></p>
-        <p style="font-size: 15px; margin: 6px 0;">
-            📞 Телефон для связи: <a href="tel:+79911548118" style="color: #4a90e2; text-decoration: none;">8 991 154 81 18</a>
-        </p>
-        <p style="font-size: 13px; margin: 12px 0 0 0; color: #999;">
-            © 2026 Генерация бесплатно! Все права защищены.
-        </p>
-    </div>
-    """)
+    login_btn.click(
+        fn=do_login,
+        inputs=[login_username, login_password],
+        outputs=[login_screen, main_screen, session_keys, login_message],
+    )
+    guest_btn.click(
+        fn=do_guest,
+        inputs=[],
+        outputs=[login_screen, main_screen, session_keys, login_message],
+    )
 
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     demo.queue(max_size=30).launch(
-        server_name="0.0.0.0", # Важно для Render
+        server_name="0.0.0.0",
         server_port=port,
+        # Больше никаких ssr_mode и auth
     )
