@@ -5,3 +5,4 @@ edge-tts
 deep-translator
 imageio-ffmpeg
 moviepy==2.2.1
+boto3
