@@ -4,4 +4,4 @@ pillow
 edge-tts
 deep-translator
 imageio-ffmpeg
-moviepy
+moviepy==2.0.0.dev2
