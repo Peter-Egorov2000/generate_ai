@@ -79,11 +79,11 @@ GENERATION_MODES = {
 
 # ========== ПРОВАЙДЕРЫ ИЗОБРАЖЕНИЙ ==========
 IMAGE_PROVIDERS = {
+    "Agnes AI ⭐": "agnes",
     "Pollinations": "pollinations",
-    "Agnes AI": "agnes",
 }
 
-# Доступные бесплатные модели Pollinations (без платных)
+# Доступные бесплатные модели Pollinations
 POLLINATIONS_FREE_MODELS = [
     "⚡ turbo (быстро)",
     "🖼️ stable-diffusion",
@@ -96,8 +96,6 @@ AGNES_MODELS = [
     "agnes-image-2.5-flash",
     "agnes-image-2.0-flash",
 ]
-
-
 
 
 def get_pollinations_headers(keys):
@@ -236,33 +234,47 @@ def upload_image_to_hosting(image_path, keys):
     return None
 
 
-# ========== ПЕРЕВОД ==========
+# ========== ПЕРЕВОД (3 попытки + логи) ==========
 def translate_to_english(text: str) -> str:
-    """Перевод с фолбэком на несколько сервисов."""
+    """Перевод с фолбэком на несколько сервисов + подробные логи."""
     if not text or not text.strip():
         return text
 
     text = text.strip()
+    print(f"🌐 Перевожу: {text[:60]}...")
 
     # --- Попытка 1: MyMemory ---
     try:
         result = MyMemoryTranslator(source="ru-RU", target="en-GB").translate(text)
         if result and result.strip() and result.strip().lower() != text.lower():
+            print(f"✅ MyMemory сработал: {result[:60]}")
             return result
+        print(f"⚠️ MyMemory вернул то же самое")
     except Exception as e:
-        print(f"⚠️ MyMemory: {e}")
+        print(f"⚠️ MyMemory ошибка: {e}")
 
-    # --- Попытка 2: Google через deep-translator ---
+    # --- Попытка 2: Google ---
     try:
         from deep_translator import GoogleTranslator
         result = GoogleTranslator(source="ru", target="en").translate(text)
         if result and result.strip() and result.strip().lower() != text.lower():
+            print(f"✅ Google сработал: {result[:60]}")
+            return result
+        print(f"⚠️ Google вернул то же самое")
+    except Exception as e:
+        print(f"⚠️ Google ошибка: {e}")
+
+    # --- Попытка 3: Linguee ---
+    try:
+        from deep_translator import LingueeTranslator
+        result = LingueeTranslator(source="russian", target="english").translate(text)
+        if result and result.strip() and result.strip().lower() != text.lower():
+            print(f"✅ Linguee сработал: {result[:60]}")
             return result
     except Exception as e:
-        print(f"⚠️ Google: {e}")
+        print(f"⚠️ Linguee ошибка: {e}")
 
-    # --- Ничего не помогло — возвращаем как есть ---
-    print(f"⚠️ Перевод не удался, используется исходный промпт")
+    print(f"❌ Все переводчики отказали, отправляю русский как есть")
     return text
 
 
@@ -347,7 +359,7 @@ def concatenate_videos_with_progress(clip_paths, output_path, audio_path=None,
 
 # ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ — ДИСПЕТЧЕР ==========
 def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
-                        do_translate, keys, status_cb=None, provider="pollinations"):
+                        do_translate, keys, status_cb=None, provider="agnes"):
     """Диспетчер генерации изображений по провайдеру."""
     if not prompt or not prompt.strip():
         raise ValueError("Введи промпт!")
@@ -363,7 +375,7 @@ def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
     if status_cb:
         status_cb(f"Генерирую через {provider}...")
 
-    # --- Pollinations ---
+    # --- Pollinations (retry на 402/429/500) ---
     if provider == "pollinations":
         model_name = parse_model_name(model)
         encoded = urllib.parse.quote(final_prompt)
@@ -372,22 +384,21 @@ def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
                f"?width={int(width)}&height={int(height)}&seed={seed_val}"
                f"&model={model_name}&nologo={'true' if nologo else 'false'}"
                f"&enhance={'true' if enhance else 'false'}")
-    
-        # Retry при 402 (rate limit)
+
         r = None
         for attempt in range(3):
             r = requests.get(url, headers=get_pollinations_headers(keys), timeout=180)
-            if r.status_code == 402:
+            if r.status_code in (402, 429, 500):
                 wait = 5 * (attempt + 1)
                 if status_cb:
-                    status_cb(f"⏳ Лимит Pollinations, жду {wait} сек...")
+                    status_cb(f"⏳ Сервер занят ({r.status_code}), повтор через {wait} сек...")
                 time.sleep(wait)
                 continue
             break
-    
-        if r is None or r.status_code == 402:
-            raise ValueError("❌ Лимит Pollinations исчерпан. Смените провайдера на Agnes AI.")
-    
+
+        if r is None or r.status_code in (402, 429, 500):
+            raise ValueError(f"❌ Pollinations недоступен ({r.status_code if r else 'timeout'}). Переключитесь на Agnes AI.")
+
         r.raise_for_status()
         if not r.headers.get("Content-Type", "").startswith("image/"):
             raise ValueError(f"Pollinations вернул не картинку: {r.text[:200]}")
@@ -396,9 +407,12 @@ def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
 
     # --- Agnes AI ---
     elif provider == "agnes":
-        img = generate_image_agnes(final_prompt, width, height, model, seed, keys)
+        model_name = parse_model_name(model) or model
+        img = generate_image_agnes(final_prompt, width, height, model_name, seed, keys)
         seed_used = "—"
 
+    else:
+        raise ValueError(f"Неизвестный провайдер: {provider}")
 
     # Сохраняем результат
     seed_for_file = seed_used if seed_used != "—" else int(time.time() * 1000) % 1_000_000
@@ -431,7 +445,7 @@ def generate_image_agnes(prompt, width, height, model, seed=None, keys=None):
         "model": model,
         "prompt": prompt,
         "size": size,
-        "extra_body": {"response_format": "url"},
+        "response_format": "url",
     }
     # Добавляем соотношение сторон, если размер задан тиром
     if size in ("1K", "2K", "3K", "4K"):
@@ -450,17 +464,13 @@ def generate_image_agnes(prompt, width, height, model, seed=None, keys=None):
     resp.raise_for_status()
     data = resp.json()
 
-    # Agnes возвращает URL изображения
     image_url = data.get("data", [{}])[0].get("url")
     if not image_url:
         raise ValueError(f"Agnes не вернул URL: {data}")
 
-    # Скачиваем изображение
     img_resp = requests.get(image_url, timeout=120)
     img_resp.raise_for_status()
     return Image.open(BytesIO(img_resp.content)).convert("RGB")
-
-
 
 
 # ========== ГЕНЕРАЦИЯ ВИДЕО (AGNES) ==========
@@ -717,7 +727,7 @@ def render_main():
                 st.title("🎨 Генерация бесплатно!")
         else:
             st.title("🎨 Генерация бесплатно!")
-        st.caption("**Картинки:** Pollinations · Agnes AI · InferencePort · **Видео:** Agnes AI · **Склейка:** MoviePy · **Озвучка:** EdgeTTS")
+        st.caption("**Картинки:** Agnes AI · Pollinations · **Видео:** Agnes AI · **Склейка:** MoviePy · **Озвучка:** EdgeTTS")
         role = "владелец" if st.session_state.is_owner else "гость"
         st.info(f"👤 Вы вошли как **{role}**")
 
@@ -743,16 +753,17 @@ def render_main():
                 list(IMAGE_PROVIDERS.keys()),
                 index=0,
                 key="img_provider",
-                help="InferencePort — без цензуры, Agnes AI — качество, Pollinations — скорость",
+                help="Agnes AI — стабильнее, Pollinations — быстрее",
             )
 
             # --- Модель (динамически меняется по провайдеру) ---
             if provider == "Pollinations":
-                default_model = POLLINATIONS_FREE_MODELS[0]
                 model_choices = POLLINATIONS_FREE_MODELS
-            elif provider == "Agnes AI":
-                default_model = AGNES_MODELS[0]
+            elif provider == "Agnes AI ⭐":
                 model_choices = AGNES_MODELS
+            else:
+                model_choices = AGNES_MODELS
+
             model = st.selectbox(
                 "Модель",
                 model_choices,
@@ -778,13 +789,14 @@ def render_main():
                 height = st.slider("Высота", 256, 1536, 1024, 64, key="img_height")
 
             seed = st.number_input("Seed (0 = случайный)", min_value=0, value=0, step=1, key="img_seed")
+
             if st.button("✨ Сгенерировать", type="primary", width="stretch"):
                 try:
                     progress = st.progress(0, text="Старт...")
-            
+
                     def status(text):
                         progress.progress(0.5, text=text)
-            
+
                     provider_key = IMAGE_PROVIDERS[provider]
                     img, path, seed_used, translated = generate_image_core(
                         prompt, width, height, model, seed, nologo, enhance,
@@ -794,7 +806,6 @@ def render_main():
                     st.session_state.img_result = {
                         "img": img, "path": path, "seed": seed_used, "translated": translated
                     }
-                    # st.rerun() — УБРАНО
                 except Exception as e:
                     st.error(f"❌ {e}")
 
@@ -832,7 +843,9 @@ def render_main():
 
             if b_provider == "Pollinations":
                 b_model_choices = POLLINATIONS_FREE_MODELS
-            elif b_provider == "Agnes AI":
+            elif b_provider == "Agnes AI ⭐":
+                b_model_choices = AGNES_MODELS
+            else:
                 b_model_choices = AGNES_MODELS
 
             b_model = st.selectbox("Модель", b_model_choices, index=0, key="batch_model")
@@ -869,7 +882,7 @@ def render_main():
                         time.sleep(1)
                     progress.progress(1.0, text="Готово!")
                     st.session_state.batch_results = results
-                    st.rerun()
+                    # st.rerun() — УБРАНО
 
         with col_right:
             results = st.session_state.get("batch_results", [])
@@ -937,7 +950,7 @@ def render_main():
                             "video": final_video, "audio": final_audio,
                             "audio_msg": audio_msg, "translated": translated
                         }
-                        st.rerun()
+                        # st.rerun() — УБРАНО
                     except Exception as e:
                         st.error(f"❌ {e}")
 
