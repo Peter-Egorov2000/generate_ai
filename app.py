@@ -1030,7 +1030,15 @@ def render_main():
 
             v_do_translate = st.checkbox("🌐 Переводить промпт", value=True, key="vid_translate")
 
-            video_duration = st.slider("Длительность (секунд)", 5, 120, 10, 5, key="vid_duration")
+            video_duration = st.slider(
+                "Длительность (секунд)",
+                min_value=5,
+                max_value=180,
+                value=10,
+                step=1,                        # ← было 5, стало 1
+                key="vid_duration",
+                help="Любое число от 5 до 180. Приложение само разобьёт на клипы ≤ 18            сек.",
+            )
 
             # Показываем разбиение
             n_clips, n_frames, clip_sec = calculate_clips(video_duration)
