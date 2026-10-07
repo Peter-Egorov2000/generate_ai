@@ -81,16 +81,13 @@ GENERATION_MODES = {
 IMAGE_PROVIDERS = {
     "Pollinations": "pollinations",
     "Agnes AI": "agnes",
-    "InferencePort (без цензуры)": "inferenceport",
 }
 
 # Доступные бесплатные модели Pollinations (без платных)
 POLLINATIONS_FREE_MODELS = [
-    "🎨 flux (баланс)",
     "⚡ turbo (быстро)",
     "🖼️ stable-diffusion",
-    "🔄 kontext (image-to-image)",
-    "🍌 nanobanana",
+    "🔄 kontext",
     "🌱 seedream",
 ]
 
@@ -100,19 +97,7 @@ AGNES_MODELS = [
     "agnes-image-2.0-flash",
 ]
 
-# Модели InferencePort (без цензуры)
-INFERENCEPORT_MODELS = [
-    "flux",
-    "qwen-image",
-    "seedream",
-    "gpt-image",
-    "ideogram",
-    "imagen",
-    "wan",
-]
 
-# URL InferencePort (OpenAI-совместимый, без ключа)
-INFERENCEPORT_BASE_URL = "https://inferenceport.ai/v1"
 
 
 def get_pollinations_headers(keys):
@@ -383,13 +368,6 @@ def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
         img = generate_image_agnes(final_prompt, width, height, model, seed, keys)
         seed_used = "—"
 
-    # --- InferencePort (без цензуры) ---
-    elif provider == "inferenceport":
-        img = generate_image_inferenceport(final_prompt, width, height, model, seed)
-        seed_used = "—"
-
-    else:
-        raise ValueError(f"Неизвестный провайдер: {provider}")
 
     # Сохраняем результат
     seed_for_file = seed_used if seed_used != "—" else int(time.time() * 1000) % 1_000_000
@@ -452,33 +430,6 @@ def generate_image_agnes(prompt, width, height, model, seed=None, keys=None):
     return Image.open(BytesIO(img_resp.content)).convert("RGB")
 
 
-# ========== ГЕНЕРАЦИЯ ЧЕРЕЗ INFERENCEPORT (БЕЗ ЦЕНЗУРЫ) ==========
-def generate_image_inferenceport(prompt, width, height, model, seed=None):
-    """Генерация через InferencePort AI (без цензуры, OpenAI-совместимый API)."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "n": 1,
-        "size": f"{width}x{height}",
-        "response_format": "b64_json",
-    }
-    if seed:
-        payload["seed"] = seed
-
-    resp = requests.post(
-        f"{INFERENCEPORT_BASE_URL}/images/generations",
-        json=payload,
-        timeout=180,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    b64_data = data.get("data", [{}])[0].get("b64_json")
-    if not b64_data:
-        raise ValueError(f"InferencePort не вернул изображение: {data}")
-
-    img_bytes = base64.b64decode(b64_data)
-    return Image.open(BytesIO(img_bytes)).convert("RGB")
 
 
 # ========== ГЕНЕРАЦИЯ ВИДЕО (AGNES) ==========
@@ -771,10 +722,6 @@ def render_main():
             elif provider == "Agnes AI":
                 default_model = AGNES_MODELS[0]
                 model_choices = AGNES_MODELS
-            else:
-                default_model = INFERENCEPORT_MODELS[0]
-                model_choices = INFERENCEPORT_MODELS
-
             model = st.selectbox(
                 "Модель",
                 model_choices,
@@ -857,8 +804,6 @@ def render_main():
                 b_model_choices = POLLINATIONS_FREE_MODELS
             elif b_provider == "Agnes AI":
                 b_model_choices = AGNES_MODELS
-            else:
-                b_model_choices = INFERENCEPORT_MODELS
 
             b_model = st.selectbox("Модель", b_model_choices, index=0, key="batch_model")
 
