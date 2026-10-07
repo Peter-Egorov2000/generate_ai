@@ -238,13 +238,32 @@ def upload_image_to_hosting(image_path, keys):
 
 # ========== ПЕРЕВОД ==========
 def translate_to_english(text: str) -> str:
+    """Перевод с фолбэком на несколько сервисов."""
     if not text or not text.strip():
         return text
+
+    text = text.strip()
+
+    # --- Попытка 1: MyMemory ---
     try:
-        return MyMemoryTranslator(source="ru-RU", target="en-GB").translate(text.strip()) or text
+        result = MyMemoryTranslator(source="ru-RU", target="en-GB").translate(text)
+        if result and result.strip() and result.strip().lower() != text.lower():
+            return result
     except Exception as e:
-        print(f"⚠️ Ошибка перевода: {e}")
-        return text
+        print(f"⚠️ MyMemory: {e}")
+
+    # --- Попытка 2: Google через deep-translator ---
+    try:
+        from deep_translator import GoogleTranslator
+        result = GoogleTranslator(source="ru", target="en").translate(text)
+        if result and result.strip() and result.strip().lower() != text.lower():
+            return result
+    except Exception as e:
+        print(f"⚠️ Google: {e}")
+
+    # --- Ничего не помогло — возвращаем как есть ---
+    print(f"⚠️ Перевод не удался, используется исходный промпт")
+    return text
 
 
 # ========== ИЗВЛЕЧЕНИЕ ПОСЛЕДНЕГО КАДРА ==========
@@ -353,10 +372,22 @@ def generate_image_core(prompt, width, height, model, seed, nologo, enhance,
                f"?width={int(width)}&height={int(height)}&seed={seed_val}"
                f"&model={model_name}&nologo={'true' if nologo else 'false'}"
                f"&enhance={'true' if enhance else 'false'}")
-
-        r = requests.get(url, headers=get_pollinations_headers(keys), timeout=180)
-        if r.status_code == 402:
-            raise ValueError("❌ Лимит Pollinations исчерпан. Смените модель или провайдера.")
+    
+        # Retry при 402 (rate limit)
+        r = None
+        for attempt in range(3):
+            r = requests.get(url, headers=get_pollinations_headers(keys), timeout=180)
+            if r.status_code == 402:
+                wait = 5 * (attempt + 1)
+                if status_cb:
+                    status_cb(f"⏳ Лимит Pollinations, жду {wait} сек...")
+                time.sleep(wait)
+                continue
+            break
+    
+        if r is None or r.status_code == 402:
+            raise ValueError("❌ Лимит Pollinations исчерпан. Смените провайдера на Agnes AI.")
+    
         r.raise_for_status()
         if not r.headers.get("Content-Type", "").startswith("image/"):
             raise ValueError(f"Pollinations вернул не картинку: {r.text[:200]}")
@@ -747,14 +778,13 @@ def render_main():
                 height = st.slider("Высота", 256, 1536, 1024, 64, key="img_height")
 
             seed = st.number_input("Seed (0 = случайный)", min_value=0, value=0, step=1, key="img_seed")
-
             if st.button("✨ Сгенерировать", type="primary", width="stretch"):
                 try:
                     progress = st.progress(0, text="Старт...")
-
+            
                     def status(text):
                         progress.progress(0.5, text=text)
-
+            
                     provider_key = IMAGE_PROVIDERS[provider]
                     img, path, seed_used, translated = generate_image_core(
                         prompt, width, height, model, seed, nologo, enhance,
@@ -764,7 +794,7 @@ def render_main():
                     st.session_state.img_result = {
                         "img": img, "path": path, "seed": seed_used, "translated": translated
                     }
-                    st.rerun()
+                    # st.rerun() — УБРАНО
                 except Exception as e:
                     st.error(f"❌ {e}")
 
@@ -779,7 +809,7 @@ def render_main():
                                        width="stretch")
                 if res.get("translated"):
                     st.text_area("📝 Промпт на английском", res["translated"], height=80,
-                                 disabled=True, key="img_translated_view")
+                                 disabled=True)
 
     # ========== ВКЛАДКА 2: ПАЧКА ПРОМПТОВ ==========
     with tab2:
@@ -929,7 +959,7 @@ def render_main():
                     st.info(res["audio_msg"])
                 if res.get("translated"):
                     st.text_area("📝 Промпт на английском", res["translated"],
-                                 height=80, disabled=True, key="vid_translated_view")
+                                 height=80, disabled=True)
 
     # ========== ВКЛАДКА 4: ИСТОРИЯ ==========
     with tab4:
